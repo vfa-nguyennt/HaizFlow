@@ -341,9 +341,18 @@ class RenderExportStorageTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt" and Path("D:/").is_dir() and Path("C:/").is_dir(), "Cross-volume Windows integration")
     def test_project_on_d_drive_exports_to_c_drive(self):
-        with tempfile.TemporaryDirectory(prefix="haizflow-cross-drive-", dir=Path.cwd() / "build") as directory:
+        from haizflow.config import NATIVE_WINDOWS_USERPROFILE
+
+        # The portable runtime redirects both tempfile and environment paths.
+        # Only this export fixture uses the preserved native Windows profile.
+        native_temp = Path(NATIVE_WINDOWS_USERPROFILE) / "AppData" / "Local" / "Temp"
+        if not native_temp.is_dir():
+            self.skipTest("Native Windows temporary directory is unavailable")
+        with (tempfile.TemporaryDirectory(prefix="haizflow-cross-drive-", dir=Path.cwd() / "build") as directory,
+              tempfile.TemporaryDirectory(prefix="haizflow-cross-drive-export-", dir=native_temp) as export_directory):
             self.assertEqual(Path(directory).drive.casefold(), "d:")
-            if self.external.drive.casefold() != "c:":
+            external = Path(export_directory)
+            if external.drive.casefold() != "c:":
                 self.skipTest("Cross-volume test requires TEMP on C: and workspace on D:")
             project = project_store.create_project("Cross drive", directory, "single")
             config = VideoConfig(project_name=project["project_name"], project_directory=directory, project_key=project["key"],
@@ -356,7 +365,7 @@ class RenderExportStorageTests(unittest.TestCase):
             (staging / "video.mp4").write_bytes(b"cross-drive-render")
             manual_artifacts.publish(video.video_id, "export", revision, staging, {"video": "video.mp4"}, config_fingerprint=revision)
             video = video_store.get_video(video.video_id)
-            target = self.external / "Cross drive.mp4"
+            target = external / "Cross drive.mp4"
             video_export.export_video(video, target)
             self.assertEqual(target.read_bytes(), b"cross-drive-render")
             project_store.delete_project_by_key(project["key"])
@@ -778,6 +787,72 @@ class RenderExportStorageTests(unittest.TestCase):
                 write.assert_not_called()
             self.assertEqual(project_store.get_project(project["key"])["batch_settings"]["values"], baseline)
         self.assertEqual(self.host._show_app_alert.call_count, 3)
+
+    def test_failed_batch_settings_commit_keeps_completed_render_and_checkpoint_intact(self):
+        from haizflow.desktop.project_commands_controller import ProjectCommandsController
+        from haizflow.desktop.qml_controller import HaizFlowController
+
+        project, video = self.make_video(kind="batch")
+        self.host._selected_project_key = project["key"]
+        self.host._batch_video_ids = [video.video_id]
+        self.host._settings_processing_device = "cpu"
+        self.host._normalized_tts_provider = lambda language, provider: provider
+        self.host._normalized_voice_for_language = lambda language, voice, provider: voice
+        self.host._video_settings_snapshot = HaizFlowController._video_settings_snapshot
+        self.host._video_config_from_snapshot = HaizFlowController._video_config_from_snapshot
+        self.host._apply_config_to_video = lambda value, config: HaizFlowController._apply_config_to_video(
+            self.host, value, config)
+        self.host._preserve_edit_asset = lambda identifier, path: path
+        self.host._capture_video_asset_snapshot = lambda value, **kwargs: HaizFlowController._capture_video_asset_snapshot(
+            self.host, value, **kwargs)
+        self.host._restore_video_asset_snapshot = lambda identifier, snapshot: HaizFlowController._restore_video_asset_snapshot(
+            self.host, identifier, snapshot)
+        self.host._show_app_alert = Mock()
+        self.host._record_batch_asset_change = Mock()
+        commands = ProjectCommandsController(self.host)
+        commands.batch_settings_values()  # Establish the shared baseline before injecting a write failure.
+        old_render = video_export.current_render(video)
+        old_bytes = Path(old_render["resolved_outputs"]["video"]).read_bytes()
+        with patch.object(project_store, "save_batch_settings", side_effect=OSError("disk full")):
+            self.assertFalse(commands.apply_batch_settings_values(project["key"], {"originalVolume": 37}))
+        refreshed = video_store.get_video(video.video_id)
+        self.assertEqual(refreshed.status, "done")
+        self.assertEqual(refreshed.original_video_volume, video.original_video_volume)
+        self.assertEqual(refreshed.checkpoints, video.checkpoints)
+        self.assertEqual(refreshed.active_artifacts, video.active_artifacts)
+        self.assertEqual(video_export.current_render(refreshed), old_render)
+        self.assertEqual(Path(old_render["resolved_outputs"]["video"]).read_bytes(), old_bytes)
+        self.host._record_batch_asset_change.assert_not_called()
+
+    def test_batch_defaults_index_failure_restores_the_project_manifest_too(self):
+        project, _video = self.make_video(kind="batch")
+        project_store.save_batch_settings(project["key"], {"originalVolume": 60})
+        project_store.create_project("Other project", str(self.root / "projects"), "manual")
+        manifest = Path(project_store.project_root_for_key(project["key"])) / project_store.PROJECT_MANIFEST_NAME
+        before_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+        before_index = json.loads(Path(project_store.PROJECT_INDEX_PATH).read_text(encoding="utf-8"))
+        save_index = project_store._save_index
+        for fail_after_write in (False, True):
+            with self.subTest(fail_after_write=fail_after_write):
+                calls = 0
+
+                def fail_once(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        if fail_after_write:
+                            save_index(*args, **kwargs)
+                        raise OSError("index write failed")
+                    return save_index(*args, **kwargs)
+
+                with patch.object(project_store, "_save_index", side_effect=fail_once), self.assertRaises(OSError):
+                    project_store.save_batch_settings(project["key"], {"originalVolume": 37})
+                self.assertEqual(json.loads(manifest.read_text(encoding="utf-8")), before_manifest)
+                self.assertEqual(json.loads(Path(project_store.PROJECT_INDEX_PATH).read_text(encoding="utf-8")), before_index)
+                self.assertEqual(project_store.get_project(project["key"])["batch_settings"]["values"], {"originalVolume": 60})
+                backup = json.loads(Path(project_store._index_backup_path()).read_text(encoding="utf-8"))
+                saved = next(item for item in backup if item["key"] == project["key"])
+                self.assertEqual(saved["batch_settings"]["values"], {"originalVolume": 60})
 
     def test_batch_invalid_subtitle_style_does_not_partially_apply_or_replace_overrides(self):
         from haizflow.desktop.project_commands_controller import ProjectCommandsController

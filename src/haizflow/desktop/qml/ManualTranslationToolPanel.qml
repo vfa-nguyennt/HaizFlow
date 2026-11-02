@@ -61,6 +61,18 @@ ColumnLayout {
                 root.inspector.scheduleSave();
         }
     }
+    GeminiGuidanceButton {
+        Layout.fillWidth: true
+        visible: AppController.translationModel.indexOf("gemini-") === 0
+        enabled: root.inspector.editable
+        instructions: AppController.geminiTranslationInstructions
+        glossary: AppController.geminiTranslationGlossary
+        translationStyle: AppController.geminiTranslationStyle
+        saveHandler: function(instructions, glossary, style, sourceKey) {
+            return AppController.saveGeminiTranslationGuidance(AppController.projectKey,
+                AppController.selectedVideoId, instructions, glossary, style, sourceKey);
+        }
+    }
     SettingLabel {
         Layout.fillWidth: true
         text: qsTr("Dịch sang")

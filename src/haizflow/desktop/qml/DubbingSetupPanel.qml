@@ -34,6 +34,13 @@ InspectorPanel {
                 || AppController.ttsProvider.indexOf("vieneu") === 0
             speechRecognitionModel: AppController.speechRecognitionModel
             translationModel: AppController.translationModel
+            geminiInstructions: AppController.geminiTranslationInstructions
+            geminiGlossary: AppController.geminiTranslationGlossary
+            geminiStyle: AppController.geminiTranslationStyle
+            geminiGuidanceSaveHandler: function(instructions, glossary, style, sourceKey) {
+                return AppController.saveGeminiTranslationGuidance(AppController.projectKey,
+                    AppController.selectedVideoId, instructions, glossary, style, sourceKey);
+            }
             speechRecognitionOptions: AppController.speechRecognitionModelOptions
             speechRecognitionIndex: AppController.speechRecognitionModelIndex
             targetLanguage: AppController.targetLanguage
